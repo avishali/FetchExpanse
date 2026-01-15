@@ -1,0 +1,145 @@
+ROLE: IMPLEMENTER
+MODE: Local repo on Mac. FetchExpanse is production-ready with Gmail pagination + high recall safety enforced.
+MISSION: Phase 2.5 — Link Capture (Playwright) for invoice/receipt URLs
+RISK PROFILE: Medium (browser automation), must not break scan/review/export. Must be safe, bounded, and predictable.
+DO NOT: Add OCR. Do not add ML. Do not change OAuth scopes. Do not run unbounded captures.
+
+GOAL
+Automatically capture invoice/receipt pages linked in emails as:
+- PDF (preferred)
+- Screenshot (fallback)
+and store them as evidence items so they can be exported to Dropbox like attachments.
+
+SCOPE
+1) Add Playwright-based capture to evidence pipeline.
+2) Add strict safety controls:
+   - Per-link timeout
+   - Max links per message
+   - Only capture “invoice-likely” links
+3) Preserve idempotency:
+   - If link already captured (same URL hash), skip.
+4) Update UI to show link evidence and allow open/reveal.
+
+DEPENDENCIES
+- Add Playwright (chromium) as a dependency if not already present.
+- Ensure docs include Playwright install step if needed.
+- Keep dependencies minimal.
+
+NEW/UPDATED CONFIG
+Add config options (env + defaults):
+- LINK_CAPTURE_ENABLED=true|false (default false)
+- LINK_CAPTURE_MAX_PER_MESSAGE=2
+- LINK_CAPTURE_TIMEOUT_MS=20000
+- LINK_CAPTURE_NAV_TIMEOUT_MS=15000
+- LINK_CAPTURE_USER_AGENT="FetchExpanse/1.0"
+- LINK_CAPTURE_ALLOWLIST_DOMAINS= (optional comma-separated; empty means allow all but apply heuristics)
+- LINK_CAPTURE_BLOCKLIST_DOMAINS= (default includes facebook.com, instagram.com, tiktok.com, etc.)
+- LINK_CAPTURE_HEADLESS=true (default true)
+
+Add these to:
+- .env.example
+- README.md
+- SPEC.md
+
+EVIDENCE MODEL
+Extend evidence_items kinds to include:
+- LINK_PDF
+- LINK_SCREENSHOT
+- LINK_HTML_SNAPSHOT (fallback)
+Store:
+- source_url (canonicalized)
+- sha256
+- local_path
+- mime_type (application/pdf or image/png or text/html)
+- filename
+
+LINK SELECTION LOGIC (CRITICAL)
+Only attempt capture for links that are “invoice-likely”.
+Implement a scoring function pickInvoiceLinks(urls, subject, bodyText, bodyHtml) that:
+- Prefers URLs containing keywords:
+  invoice, receipt, billing, download, pdf, order, payment
+  חשבונית, קבלה, תשלום, חיוב, עסקה, מס
+- Deprioritizes tracking/ads:
+  utm_, doubleclick, mailchimp, facebook, instagram, tiktok
+- Canonicalizes URLs by removing common tracking params (utm_*, fbclid, gclid) BEFORE hashing.
+- Returns top N links (N = LINK_CAPTURE_MAX_PER_MESSAGE).
+If message has attachments already:
+- Still allow link capture, but only if link score exceeds a threshold (avoid extra noise).
+
+PLAYWRIGHT CAPTURE (IMPLEMENT)
+Create /src/evidence/linkCapturePlaywright.ts with:
+- captureLinkToEvidence(url, outDir, opts) -> { kind, path, mimeType, sha256, filename }
+Flow:
+1) Launch chromium with safe args.
+2) Create context with user agent and default viewport.
+3) Block known heavy resource types optionally (fonts, media) to speed up.
+4) goto(url) with timeout NAV_TIMEOUT
+5) Wait for network idle OR short settle delay (e.g., 1.5s)
+6) Try:
+   - page.pdf({ format: "A4", printBackground: true }) if supported
+   - If pdf fails, do fullPage screenshot
+7) If navigation fails or page errors:
+   - Save HTML content snapshot if any
+   - Mark evidence as LINK_HTML_SNAPSHOT
+8) Always close browser, even on errors.
+
+SAFETY CONSTRAINTS (MANDATORY)
+- Never follow more than MAX_PER_MESSAGE links.
+- Per-link timeout strictly enforced.
+- If the page asks for login or blocks automation:
+  - Save HTML snapshot (if accessible) and mark TO_REVIEW reason “Portal/login required”
+- Do not attempt to bypass paywalls/logins/captchas.
+- Do not store cookies beyond the single capture session.
+- Never log full URLs if they can contain sensitive tokens:
+  - Log only hostname + path (strip query), or a hashed URL id.
+
+PIPELINE INTEGRATION (MANDATORY)
+Update evidence step so:
+- After attachment extraction, run link capture if enabled and link candidates exist.
+- Save captured files under staging:
+  ./data/staging/<rangeLabel>/<messageId>/links/
+- Insert evidence_items row for each captured artifact.
+- If capture fails, still create a TO_REVIEW reason entry for that message.
+
+IDEMPOTENCY (MANDATORY)
+Before capturing:
+- Compute canonicalUrlHash (sha256 of canonical URL string)
+- If evidence_items already contains an entry with same message_id + source_url hash, skip capture.
+Do not create duplicates on rerun.
+
+ELECTRON UI (MINIMAL CHANGES)
+- Review Detail: show link evidence alongside attachments
+- Add buttons:
+  - Open
+  - Reveal in Finder
+- Display “Captured from link” with hostname (no full query)
+
+CLI / UX
+- scan and export should remain unchanged.
+- Add optional command:
+  expense capture-links --from ... --to ... --limit ...
+to run link capture on already-scanned messages (optional but helpful). If too much for now, skip and rely on normal scan pipeline.
+
+DOCS (MANDATORY)
+Update README.md:
+- How to enable link capture
+- Playwright install notes
+- Common failure reasons (portal/login) and how they appear as TO_REVIEW
+
+Update SPEC.md:
+- Link capture algorithm
+- Safety constraints and timeouts
+
+DEFINITION OF DONE
+- npm run build passes
+- Link capture is OFF by default (safe)
+- When enabled, link-only invoice emails produce evidence files in staging
+- Evidence is exported to Dropbox with normal export flow
+- Reruns do not duplicate link evidence
+- UI shows captured link evidence
+- No secrets/tokens printed
+
+OUTPUT FORMAT
+Single unified diff patch (git patch).
+No extra commentary.
+BEGIN.

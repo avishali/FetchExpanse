@@ -1,0 +1,67 @@
+ROLE: IMPLEMENTER
+MODE: Electron + React (NO React Router)
+MISSION: Implement browser-like Back/Forward navigation using an internal navigation stack
+
+CONTEXT
+The app does not use react-router.
+Navigation is currently implicit, causing:
+- No reliable Back/Forward
+- Lost list context
+- User trapped after following links
+
+GOAL
+Provide deterministic Back / Forward behavior like a browser.
+
+REQUIREMENTS
+
+A) NAVIGATION STACK
+Implement a global NavigationStore with:
+- past: View[]
+- current: View
+- future: View[]
+
+Expose actions:
+- navigateTo(view)
+- goBack()
+- goForward()
+
+Rules:
+- navigateTo:
+  - push current → past
+  - clear future
+- goBack:
+  - pop from past → current
+  - push old current → future
+- goForward:
+  - pop from future → current
+  - push old current → past
+
+B) VIEW DEFINITION
+Views must include enough state to restore UI:
+- Organize: filters, date range, read/unread, scroll/page
+- ReviewDetail: messageId + from Organize snapshot
+
+C) UI
+- Add Back / Forward buttons in app header
+- Disable when no past/future
+- Keyboard:
+  - Alt+Left → Back
+  - Alt+Right → Forward
+
+D) LINK SAFETY
+Navigation stack must NOT be affected by:
+- External links
+- Invoice downloads
+Those must not call navigateTo.
+
+E) DEFINITION OF DONE
+- Back returns to exact previous view + state
+- Forward works symmetrically
+- No accidental navigation replaces app UI
+- No dependency on react-router introduced
+- Build passes
+
+OUTPUT
+Unified diff patch only.
+No explanation.
+BEGIN.

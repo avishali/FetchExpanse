@@ -1,0 +1,85 @@
+ROLE: IMPLEMENTER
+MODE: Local repo on Mac. Electron Desktop UI already implemented and verified.
+TASK: Implement Phase 1.5 — UX Acceleration for Review workflow.
+SCOPE: UI + IPC + small DB queries only. No pipeline or OAuth changes.
+
+GOAL
+Make Review fast, keyboard-driven, and low-friction:
+- Keyboard shortcuts
+- Approve & Next
+- Vendor auto-fill
+- Batch approve
+
+FILES TO MODIFY (EXPECTED)
+/desktop/renderer/src/pages/ReviewList.tsx
+/desktop/renderer/src/pages/ReviewDetail.tsx
+/desktop/renderer/src/components/Table.tsx
+/desktop/renderer/src/components/ConfirmDialog.tsx
+/desktop/renderer/src/state/store.ts
+/desktop/main/ipc.ts
+/desktop/shared/ipcTypes.ts
+/src/app/operations.ts (or equivalent DB wrappers)
+
+FEATURES TO IMPLEMENT
+
+1) Keyboard Shortcuts (Review Detail)
+Active only when focus is NOT in an input.
+Keys:
+- 1 → set status EXPENSE
+- 2 → set status TO_REVIEW
+- 3 → set status NOT_EXPENSE
+- Enter → Save + Next
+- j → Next item
+- k → Previous item
+- o → Open first evidence
+- f → Reveal first evidence in Finder
+- esc → Back to Review List
+Add a small footer hint listing shortcuts.
+
+2) Approve & Next
+- Saving a decision automatically navigates to the next item
+- “Next” respects current filter + date range
+- If no next item, show toast: “All items reviewed”
+IPC:
+- add getNextReviewItem(currentId, range, filter)
+
+3) Vendor Auto-fill
+When loading Review Detail:
+- Pre-fill vendor/category if a previous decision exists for:
+  - Same sender domain OR
+  - Same normalized vendor
+- Never auto-save
+- User override replaces suggestion
+IPC:
+- add getSuggestedDecision(messageId)
+
+4) Batch Approve (Review List)
+- Enable row selection (checkboxes)
+- Show batch toolbar when ≥1 selected
+- Batch action dialog:
+  - Status (required)
+  - Vendor override (optional)
+  - Category (optional)
+- Confirmation dialog before applying
+IPC:
+- add applyBatchDecision(messageIds[], decision)
+
+SAFETY & UX RULES
+- No silent mass updates
+- Always show confirmation for batch
+- No secrets in logs
+- Renderer must not access DB directly
+
+DEFINITION OF DONE
+- Keyboard-only review is possible
+- Single-item review is one keystroke + Enter
+- Vendor auto-fill reduces typing
+- Batch approve works and is confirmed
+- No regression to scan/export/auth
+- npm run desktop:dev works
+- No console errors
+
+OUTPUT FORMAT
+Return a single unified diff patch (git patch). No extra commentary.
+
+BEGIN.

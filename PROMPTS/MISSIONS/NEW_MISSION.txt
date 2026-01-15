@@ -1,0 +1,144 @@
+---
+
+## Electron Architecture & Operations (Authoritative)
+
+This section defines **how FetchExpanse Desktop is structured**, what runs where, and which rules must not be violated when extending the app.
+
+---
+
+## Process Model (Must Not Be Broken)
+
+### Electron Main Process
+Responsible for:
+- SQLite database access
+- Filesystem access (evidence files, logs, staging)
+- OAuth flows (Gmail + Dropbox)
+- Token storage and refresh
+- Running core operations (scan, export, recurring)
+- Emitting progress events
+
+Main process **imports core logic from `/src`** and exposes a **strict IPC API**.
+
+### Renderer Process
+Responsible for:
+- UI rendering only
+- User interactions
+- Displaying progress, lists, details
+- Triggering actions via IPC
+
+Renderer:
+- Has **NO direct DB access**
+- Has **NO filesystem access**
+- Has **NO access to env secrets or tokens**
+
+### Shared Core Logic (`/src`)
+Pure application logic:
+- Gmail scanning
+- Dropbox exporting
+- Classification
+- Recurring detection
+- Date range resolution
+
+This logic is reused by:
+- CLI
+- Electron Main
+
+---
+
+## Security Boundary (Immutable Rules)
+
+These rules are intentional and must not be relaxed:
+
+- `contextIsolation = true`
+- `nodeIntegration = false`
+- Renderer cannot import `fs`, `path`, or DB modules
+- All mutations go through IPC → Main
+- OAuth tokens never exposed to renderer
+- Tokens stored only under `DATA_DIR/tokens`
+- Logs must never print secrets or token values
+
+Any change violating these rules is a **security regression**.
+
+---
+
+## IPC Contract (Source of Truth)
+
+All IPC channels are explicitly defined and typed.
+
+### Renderer → Main
+
+| Channel | Payload | Description |
+|------|--------|------------|
+| `app:info` | none | Returns app version, paths, auth status |
+| `app:doctor` | none | Runs diagnostics (no secrets) |
+| `auth:gmail` | none | Starts Gmail OAuth |
+| `auth:dropbox` | none | Starts Dropbox OAuth |
+| `scan:start` | `{ range, options }` | Starts Gmail scan |
+| `review:list` | `{ range, filter, search, page }` | Fetch review list |
+| `review:detail` | `{ id }` | Fetch message + evidence |
+| `review:decision` | `{ id, status, vendor?, category? }` | Save decision |
+| `export:start` | `{ range, dryRun }` | Start Dropbox export |
+| `recurring:start` | `{ range }` | Run recurring detection |
+| `evidence:open` | `{ evidenceId }` | Open file with system default |
+| `evidence:reveal` | `{ evidenceId }` | Reveal file in Finder |
+
+### Main → Renderer (Events)
+
+| Event | Payload |
+|----|--------|
+| `scan:progress` | `{ stage, current, total, message? }` |
+| `export:progress` | `{ stage, current, total, message? }` |
+| `task:done` | `{ task, ok, summary }` |
+
+No wildcard or dynamic IPC handlers are allowed.
+
+---
+
+## State Model
+
+- **SQLite DB is the single source of truth**
+- Renderer state is ephemeral and derived
+- All writes update DB first, then UI refreshes
+- Concurrent operations are serialized in Main
+
+If the UI is open during a scan/export:
+- Progress events stream live
+- Lists refresh after task completion
+
+---
+
+## Date Range Resolution (Shared Across CLI + Desktop)
+
+Supported inputs:
+- Presets: `this_year`, `last_year`, `ytd`, `last_12_months`
+- Custom: `from` / `to` (`YYYY-MM-DD`)
+
+Rules:
+- If `from` only → `to = today`
+- If `to` only → `from = to - 365 days`
+- If preset selected → overrides manual input
+- Range is resolved once and reused consistently across:
+  - Scan
+  - Review
+  - Export
+  - Recurring
+
+---
+
+## Native Dependencies (IMPORTANT)
+
+FetchExpanse uses native Node modules.
+
+### Current Native Dependency
+- `better-sqlite3`
+
+### Policy
+- Native deps must be rebuilt against the Electron version
+- Version must remain pinned
+- After Electron upgrades, always rebuild
+
+### Recovery Commands
+```bash
+npm rebuild better-sqlite3
+# or if needed
+npx electron-rebuild

@@ -1,0 +1,80 @@
+ROLE: IMPLEMENTER
+TASK: Fix Gmail pagination AND enforce a strict safety policy: High Recall mode REQUIRES --limit.
+
+CONTEXT
+High Recall mode broadens Gmail queries and can easily return thousands of messages.
+To prevent accidental overload, High Recall MUST NOT run without an explicit --limit.
+
+GOALS
+1) Implement correct Gmail pagination using nextPageToken.
+2) Enforce policy: --recall=high REQUIRES --limit.
+3) Ensure normal mode behavior is unchanged.
+4) Guarantee idempotency and bounded memory usage.
+
+FILES TO MODIFY (ONLY)
+- src/gmail/gmailClient.ts
+- src/cli/commands.ts (or args handling)
+- src/pipeline/steps.ts (only if needed for limit propagation)
+- SPEC.md (document the policy clearly)
+
+REQUIREMENTS
+
+A) Pagination (MANDATORY)
+- Implement a loop over nextPageToken in GmailClient.listMessages.
+- Use gmail.users.messages.list with:
+  - userId: "me"
+  - q
+  - includeSpamTrash
+  - pageToken
+  - maxResults (use highest safe value Gmail allows, otherwise 100)
+- Collect message IDs across pages.
+- Stop fetching when:
+  - nextPageToken is null, OR
+  - options.limit is reached.
+
+B) Hard Limit Enforcement (MANDATORY)
+- If --recall=high AND options.limit is undefined:
+  - Abort immediately
+  - Print a clear error message:
+    “High recall mode requires --limit to prevent unbounded scans.”
+  - Exit with non-zero status.
+- This check must happen BEFORE any Gmail API calls.
+
+C) Normal Mode (UNCHANGED)
+- --recall=normal may run without --limit.
+- Existing behavior preserved.
+
+D) Safety & Logging
+- Never log:
+  - OAuth tokens
+  - Query contents
+  - Message IDs
+- Allowed debug logs (optional):
+  - Page count fetched
+  - Total messages collected (numeric only)
+
+E) Idempotency
+- Pagination must not create duplicate DB entries.
+- Rerunning scan with same parameters must not inflate counts.
+
+F) Documentation
+Update SPEC.md:
+- Explicitly state:
+  - Gmail scans are paginated
+  - High Recall mode requires --limit
+  - Reason: safety and performance
+
+DEFINITION OF DONE
+- npm run build passes
+- Normal scan works as before
+- High recall without --limit fails fast with clear error
+- High recall WITH --limit fetches across pages correctly
+- No secrets printed
+- No performance regressions
+
+OUTPUT FORMAT
+Single unified diff patch (git patch).
+No extra commentary.
+
+BEGIN.
+

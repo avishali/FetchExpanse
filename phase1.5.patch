@@ -1,0 +1,682 @@
+diff --git a/desktop/main/ipc.ts b/desktop/main/ipc.ts
+new file mode 100644
+index 0000000..c70752d
+--- /dev/null
++++ b/desktop/main/ipc.ts
+@@ -0,0 +1,201 @@
++import { ipcMain, shell } from 'electron';
++import { app } from 'electron';
++import path from 'path';
++import { config, DATA_DIR, DB_PATH } from '../../src/config';
++import { getStoredGmailTokens, authorizeGmail } from '../../src/auth/googleAuth';
++import { getStoredDropboxTokens, authorizeDropbox } from '../../src/auth/dropboxAuth';
++import { scanStep, evidenceStep } from '../../src/pipeline/steps';
++import { getDb } from '../../src/db/db';
++import { logger } from '../../src/logging/logger';
++import { DateRange, DateRangeArgs, resolveDateRange } from '../../src/types/dateRange';
++
++import { detectRecurring } from '../../src/recurring/recurringDetector';
++import { generateRecurringReport } from '../../src/report/manifest';
++import { exportStep } from '../../src/pipeline/steps';
++
++// ... existing imports ...
++
++export function setupIpc(mainWindow: any) {
++  ipcMain.on('log:error', (_event, error) => {
++      logger.error('Renderer Error:', error);
++      console.error('Renderer Error:', error);
++  });
++
++
++  ipcMain.handle('app:info', () => {
++      const gmail = getStoredGmailTokens();
++      const dropbox = getStoredDropboxTokens();
++      return {
++          version: app.getVersion(),
++          dataDir: DATA_DIR,
++          dbPath: DB_PATH,
++          auth: {
++              gmail: !!gmail,
++              dropbox: !!dropbox
++          }
++      };
++  });
++
++  ipcMain.handle('app:doctor', async () => {
++      // Simple doctor check: Check auth tokens
++      const gmail = getStoredGmailTokens();
++      const dropbox = getStoredDropboxTokens();
++      return {
++          gmail: !!gmail,
++          dropbox: !!dropbox
++      };
++  });
++
++  ipcMain.handle('open:external', async (_, url: string) => {
++      if (url && url.startsWith('http')) await shell.openExternal(url);
++  });
++
++  ipcMain.handle('auth:gmail', async () => {
++      await authorizeGmail(); // This opens browser callback
++      return true;
++  });
++
++  ipcMain.handle('auth:dropbox', async () => {
++      await authorizeDropbox();
++      return true;
++  });
++
++
++  ipcMain.handle('scan:start', async (_, args: DateRangeArgs, options: { mock?: boolean }) => {
++     try {
++         const range = resolveDateRange(args);
++         await scanStep(range, options);
++         mainWindow.webContents.send('scan:progress', { stage: 'scan', current: 100, total: 100, message: 'Scan complete' });
++         
++         await evidenceStep(options);
++         mainWindow.webContents.send('scan:progress', { stage: 'evidence', current: 100, total: 100, message: 'Evidence complete' });
++
++         return { ok: true };
++     } catch (e: any) {
++         logger.error('Scan failed', { error: e });
++         return { ok: false, error: e.message };
++     }
++  });
++
++  // Review
++  ipcMain.handle('review:list', async (_, args: DateRangeArgs, status?: string) => {
++      const db = getDb();
++      const range = resolveDateRange(args);
++
++      // Assume range is { from: 'YYYY-MM-DD', to: 'YYYY-MM-DD' }
++      // We need to filter by internal_date_ms
++      const endDate = new Date(range.to);
++      endDate.setHours(23, 59, 59, 999);
++      
++      const startMs = new Date(range.from).getTime();
++      const endMs = endDate.getTime();
++      
++      let sql = `SELECT * FROM messages WHERE internal_date_ms >= ? AND internal_date_ms <= ?`;
++      const params: any[] = [startMs, endMs];
++      
++      if (status && status !== 'ALL') {
++          sql += ` AND label = ?`;
++          params.push(status);
++      }
++      
++      sql += ` ORDER BY internal_date_ms DESC`;
++      
++      return db.prepare(sql).all(...params);
++  });
++
++  ipcMain.handle('review:detail', async (_, id: number) => {
++      const db = getDb();
++      const msg = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
++      const evidence = db.prepare('SELECT * FROM evidence_items WHERE message_id = ?').all(id);
++      return { message: msg, evidence };
++  });
++
++  ipcMain.handle('review:decision', async (_, id: number, status: string, vendor?: string, category?: string) => {
++      const db = getDb();
++      db.prepare("UPDATE messages SET label = ? WHERE id = ?").run(status, id);
++      return { ok: true };
++  });
++
++  ipcMain.handle('review:next', async (_, currentId: number, args: DateRangeArgs, filter: string) => {
++      const db = getDb();
++      const range = resolveDateRange(args);
++      const endDate = new Date(range.to);
++      endDate.setHours(23, 59, 59, 999);
++      const startMs = new Date(range.from).getTime();
++      const endMs = endDate.getTime();
++      
++      let sql = `SELECT id FROM messages WHERE internal_date_ms >= ? AND internal_date_ms <= ?`;
++      const params: any[] = [startMs, endMs];
++      
++      if (filter && filter !== 'ALL') {
++          sql += ` AND label = ?`;
++          params.push(filter);
++      }
++      sql += ` ORDER BY internal_date_ms DESC`;
++      
++      const rows = db.prepare(sql).all(...params) as { id: number }[];
++      const idx = rows.findIndex(r => r.id === currentId);
++      
++      if (idx !== -1 && idx < rows.length - 1) {
++          return rows[idx + 1].id;
++      }
++      return null;
++  });
++
++  ipcMain.handle('review:suggest', async (_, id: number) => {
++      const db = getDb();
++      const current = db.prepare('SELECT from_domain, from_email FROM messages WHERE id = ?').get(id) as any;
++      if (!current) return null;
++
++      // Try matching domain first
++      if (current.from_domain) {
++          const match = db.prepare(`
++              SELECT label, reasons_json FROM messages 
++              WHERE from_domain = ? AND label IN ('EXPENSE', 'NOT_EXPENSE') AND id != ?
++              ORDER BY internal_date_ms DESC LIMIT 1
++          `).get(current.from_domain, id) as any;
++          
++          if (match) {
++              return { status: match.label };
++              // TODO: Store vendor/category in a better way. For now just suggest status.
++          }
++      }
++      return null;
++  });
++
++  ipcMain.handle('review:batch', async (_, ids: number[], status: string, vendor?: string, category?: string) => {
++      const db = getDb();
++      const placeholders = ids.map(() => '?').join(',');
++      db.prepare(`UPDATE messages SET label = ? WHERE id IN (${placeholders})`).run(status, ...ids);
++      return { ok: true };
++  });
++
++  // Export
++  ipcMain.handle('export:start', async (_, args: DateRangeArgs, options: { mock?: boolean }) => {
++      try {
++          const range = resolveDateRange(args);
++          await exportStep(range, options);
++          mainWindow.webContents.send('export:progress', { stage: 'export', current: 100, total: 100, message: 'Export complete' });
++          return { ok: true };
++      } catch (e: any) {
++          return { ok: false, error: e.message };
++      }
++  });
++
++  // Recurring
++  ipcMain.handle('recurring:get', async (_, args: DateRangeArgs) => {
++      const range = resolveDateRange(args);
++      const patterns = detectRecurring(range);
++      const reportPath = generateRecurringReport(range, patterns);
++      return { patterns, reportPath };
++  });
++
++  // Evidence
++  ipcMain.handle('evidence:open', async (_, p: string) => {
++      if (p) await shell.openPath(p);
++  });
++  
++  ipcMain.handle('evidence:reveal', async (_, p: string) => {
++      if (p) await shell.showItemInFolder(p);
++  });
++}
+diff --git a/desktop/renderer/src/App.tsx b/desktop/renderer/src/App.tsx
+new file mode 100644
+index 0000000..e4e2bed
+--- /dev/null
++++ b/desktop/renderer/src/App.tsx
+@@ -0,0 +1,44 @@
++import React, { useState } from 'react';
++import Sidebar from './components/Sidebar';
++import Dashboard from './pages/Dashboard';
++import Scan from './pages/Scan';
++import Settings from './pages/Settings';
++import ReviewList from './pages/ReviewList';
++import ReviewDetail from './pages/ReviewDetail';
++import Export from './pages/Export';
++import Recurring from './pages/Recurring';
++
++// Simple Router since we want minimal deps. 
++// Can upgrade to react-router-dom if needed, but state-based router works for MVP.
++
++export type Page = 'dashboard' | 'scan' | 'review' | 'export' | 'recurring' | 'settings';
++
++function App() {
++  const [currentPage, setCurrentPage] = useState<Page>('dashboard');
++  const [reviewId, setReviewId] = useState<number | null>(null);
++
++  const renderPage = () => {
++    switch (currentPage) {
++      case 'dashboard': return <Dashboard onNavigate={setCurrentPage} />;
++      case 'scan': return <Scan />;
++      case 'review': 
++        if (reviewId) return <ReviewDetail id={reviewId} onBack={() => setReviewId(null)} onNext={(id) => setReviewId(id)} />;
++        return <ReviewList onSelect={setReviewId} />;
++      case 'export': return <Export />;
++      case 'recurring': return <Recurring />;
++      case 'settings': return <Settings />;
++      default: return <div>Page {currentPage} coming soon</div>;
++    }
++  };
++
++  return (
++    <div className="layout">
++      <Sidebar activePage={currentPage} onNavigate={setCurrentPage} />
++      <div className="content">
++        {renderPage()}
++      </div>
++    </div>
++  );
++}
++
++export default App;
+diff --git a/desktop/renderer/src/components/ConfirmDialog.tsx b/desktop/renderer/src/components/ConfirmDialog.tsx
+new file mode 100644
+index 0000000..d9bb6ca
+--- /dev/null
++++ b/desktop/renderer/src/components/ConfirmDialog.tsx
+@@ -0,0 +1,39 @@
++import React from 'react';
++
++interface Props {
++    title: string;
++    message: string;
++    confirmLabel?: string;
++    cancelLabel?: string;
++    onConfirm: () => void;
++    onCancel: () => void;
++    isOpen: boolean;
++}
++
++const ConfirmDialog: React.FC<Props> = ({ 
++    title, message, confirmLabel = 'Confirm', cancelLabel = 'Cancel', onConfirm, onCancel, isOpen 
++}) => {
++    if (!isOpen) return null;
++
++    return (
++        <div style={{
++            position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
++            backgroundColor: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
++            zIndex: 1000
++        }}>
++            <div style={{
++                background: 'white', padding: 20, borderRadius: 8, maxWidth: 400, width: '100%',
++                boxShadow: '0 4px 6px rgba(0,0,0,0.1)'
++            }}>
++                <h3 style={{ marginTop: 0 }}>{title}</h3>
++                <p>{message}</p>
++                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 20 }}>
++                    <button className="btn btn-secondary" onClick={onCancel}>{cancelLabel}</button>
++                    <button className="btn btn-primary" onClick={onConfirm}>{confirmLabel}</button>
++                </div>
++            </div>
++        </div>
++    );
++};
++
++export default ConfirmDialog;
+diff --git a/desktop/renderer/src/pages/ReviewDetail.tsx b/desktop/renderer/src/pages/ReviewDetail.tsx
+new file mode 100644
+index 0000000..da69444
+--- /dev/null
++++ b/desktop/renderer/src/pages/ReviewDetail.tsx
+@@ -0,0 +1,168 @@
++import React, { useState, useEffect, useCallback } from 'react';
++import { api } from '../api';
++import { useDateRange } from '../context/DateRangeContext';
++
++interface Props {
++  id: number;
++  onBack: () => void;
++  onNext: (id: number) => void;
++}
++
++const ReviewDetail: React.FC<Props> = ({ id, onBack, onNext }) => {
++  const { range } = useDateRange();
++  const [data, setData] = useState<any>(null);
++  const [pendingStatus, setPendingStatus] = useState<string | null>(null);
++  const [saving, setSaving] = useState(false);
++  
++  useEffect(() => {
++    loadData();
++  }, [id]);
++
++  useEffect(() => {
++     // Vendor Auto-fill / Suggestion
++     if (data && data.message.status === 'NEW' && !pendingStatus) {
++         api.getSuggestedDecision(id).then(suggestion => {
++             if (suggestion && suggestion.status) {
++                 setPendingStatus(suggestion.status);
++                 // Optionally show toast: "Auto-filled from previous decision"
++             }
++         });
++     }
++  }, [data]);
++
++  const loadData = async () => {
++      setPendingStatus(null);
++      const res = await api.getReviewDetail(id);
++      setData(res);
++      if (res.message.label && res.message.label !== 'TO_REVIEW') {
++          setPendingStatus(res.message.label);
++      }
++  };
++
++  const handleSaveAndNext = useCallback(async () => {
++      if (!pendingStatus) return;
++      setSaving(true);
++      
++      // Save
++      await api.setDecision(id, pendingStatus);
++      
++      // Find Next
++      const nextId = await api.getNextReviewItem(id, range, 'TO_REVIEW'); // Or filter? Assume user wants next item to review
++      
++      setSaving(false);
++      
++      if (nextId) {
++          onNext(nextId);
++      } else {
++          // If no next item found with 'TO_REVIEW', maybe just go back or stay?
++          // Spec says: If no next item, show toast: “All items reviewed”
++          alert("All items reviewed!");
++          onBack();
++      }
++  }, [id, pendingStatus, range, onNext, onBack]);
++
++  const handleKeyDown = useCallback((e: KeyboardEvent) => {
++      // Ignore if input focused
++      if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement).tagName)) return;
++
++      switch(e.key) {
++          case '1': setPendingStatus('EXPENSE'); break;
++          case '2': setPendingStatus('TO_REVIEW'); break;
++          case '3': setPendingStatus('NOT_EXPENSE'); break;
++          case 'Enter': handleSaveAndNext(); break;
++          case 'j': 
++              // unique next without save? Spec says j -> Next item
++              api.getNextReviewItem(id, range, 'ALL').then(nid => nid && onNext(nid));
++              break;
++          case 'o':
++              if (data?.evidence?.[0]?.file_path) api.openEvidence(data.evidence[0].file_path);
++              break;
++          case 'f':
++              if (data?.evidence?.[0]?.file_path) api.revealEvidence(data.evidence[0].file_path);
++              break;
++          case 'Escape': onBack(); break;
++      }
++  }, [data, handleSaveAndNext, onBack, id, range, onNext]);
++
++  useEffect(() => {
++      window.addEventListener('keydown', handleKeyDown);
++      return () => window.removeEventListener('keydown', handleKeyDown);
++  }, [handleKeyDown]);
++
++  if (!data) return <div>Loading...</div>;
++
++  const { message, evidence } = data;
++
++  return (
++      <div style={{ paddingBottom: 50 }}>
++          <button className="btn" style={{ background: '#666', marginBottom: 10 }} onClick={onBack}>&larr; Back (Esc)</button>
++          
++          <div className="card">
++              <h2>{message.subject}</h2>
++              <div style={{ display: 'flex', gap: 20, marginBottom: 20 }}>
++                  <div><strong>From:</strong> {message.from_header}</div>
++                  <div><strong>Date:</strong> {new Date(message.date_iso).toLocaleString()}</div>
++                  <div><strong>Current:</strong> {message.label}</div>
++              </div>
++
++              <div style={{ marginBottom: 20, padding: 10, background: '#f8f9fa', borderRadius: 4 }}>
++                   <label style={{ marginRight: 10, fontWeight: 'bold' }}>Decision:</label>
++                   <div style={{ display: 'flex', gap: 10, marginTop: 5 }}>
++                       <button 
++                         className={`btn ${pendingStatus === 'EXPENSE' ? 'btn-success' : 'btn-secondary'}`} 
++                         onClick={() => setPendingStatus('EXPENSE')}
++                       >
++                           (1) Expense
++                       </button>
++                       <button 
++                         className={`btn ${pendingStatus === 'TO_REVIEW' ? 'btn-warning' : 'btn-secondary'}`} 
++                         onClick={() => setPendingStatus('TO_REVIEW')}
++                       >
++                           (2) To Review
++                       </button>
++                       <button 
++                         className={`btn ${pendingStatus === 'NOT_EXPENSE' ? 'btn-danger' : 'btn-secondary'}`} 
++                         onClick={() => setPendingStatus('NOT_EXPENSE')}
++                       >
++                           (3) Not Expense
++                       </button>
++
++                       <button className="btn btn-primary" style={{ marginLeft: 'auto' }} onClick={handleSaveAndNext} disabled={!pendingStatus || saving}>
++                           {saving ? 'Saving...' : 'Save & Next (Enter)'}
++                       </button>
++                   </div>
++              </div>
++              
++              {/* Evidence */}
++              <h4>Evidence Items</h4>
++              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 10 }}>
++                  {evidence.map((ev: any) => (
++                      <div key={ev.id} style={{ border: '1px solid #ccc', padding: 10, borderRadius: 4 }}>
++                          <div style={{ fontWeight: 'bold', fontSize: 13, marginBottom: 5 }}>{ev.filename}</div>
++                          <div style={{ fontSize: 12, color: '#666', marginBottom: 5 }}>{ev.type}</div>
++                          <div style={{ display: 'flex', gap: 5 }}>
++                              {ev.file_path && (
++                                  <>
++                                    <button className="btn" style={{ fontSize: 10, padding: 4 }} onClick={() => api.openEvidence(ev.file_path)}>Open (o)</button>
++                                    <button className="btn" style={{ fontSize: 10, padding: 4, background: '#666' }} onClick={() => api.revealEvidence(ev.file_path)}>Reveal (f)</button>
++                                  </>
++                              )}
++                          </div>
++                      </div>
++                  ))}
++              </div>
++          </div>
++          
++          <div className="card">
++              <h4>Raw Snippet</h4>
++              <pre style={{ whiteSpace: 'pre-wrap', background: '#f5f5f5', padding: 10 }}>{message.snippet}</pre>
++          </div>
++
++          <div style={{ position: 'fixed', bottom: 0, left: 250, right: 0, background: '#333', color: '#fff', padding: '5px 20px', fontSize: 12 }}>
++              Shortcuts: <strong>1/2/3</strong> Status &bull; <strong>Enter</strong> Save & Next &bull; <strong>j</strong> Skip &bull; <strong>o</strong> Open &bull; <strong>Esc</strong> Back
++          </div>
++      </div>
++  );
++};
++
++export default ReviewDetail;
+diff --git a/desktop/renderer/src/pages/ReviewList.tsx b/desktop/renderer/src/pages/ReviewList.tsx
+new file mode 100644
+index 0000000..a0f0940
+--- /dev/null
++++ b/desktop/renderer/src/pages/ReviewList.tsx
+@@ -0,0 +1,160 @@
++import React, { useState, useEffect } from 'react';
++import { api } from '../api';
++import DateRangePicker, { DateRangeState, DateRangePreset } from '../components/DateRangePicker';
++import { useDateRange } from '../context/DateRangeContext';
++import ConfirmDialog from '../components/ConfirmDialog';
++
++interface Props {
++  onSelect: (id: number) => void;
++}
++
++const ReviewList: React.FC<Props> = ({ onSelect }) => {
++  const { range, setRange } = useDateRange();
++  const [filter, setFilter] = useState('TO_REVIEW');
++  const [items, setItems] = useState<any[]>([]);
++  const [loading, setLoading] = useState(false);
++  
++  // Batch State
++  const [selectedIds, setSelectedIds] = useState<number[]>([]);
++  const [showConfirm, setShowConfirm] = useState(false);
++  const [batchAction, setBatchAction] = useState<'EXPENSE' | 'NOT_EXPENSE' | null>(null);
++
++  useEffect(() => {
++    loadItems();
++    setSelectedIds([]); // Clear selection on filter change
++  }, [range, filter]);
++
++  const loadItems = async () => {
++    setLoading(true);
++    try {
++      const res = await api.getReviewList(range, filter);
++      setItems(res || []);
++    } catch (e) {
++      console.error(e);
++    }
++    setLoading(false);
++  };
++
++  const toggleSelect = (id: number) => {
++    setSelectedIds(prev => prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id]);
++  };
++
++  const toggleSelectAll = () => {
++    if (selectedIds.length === items.length) {
++      setSelectedIds([]);
++    } else {
++      setSelectedIds(items.map(i => i.id));
++    }
++  };
++
++  const handleBatchClick = (action: 'EXPENSE' | 'NOT_EXPENSE') => {
++      setBatchAction(action);
++      setShowConfirm(true);
++  };
++
++  const executeBatch = async () => {
++      if (!batchAction) return;
++      try {
++          await api.applyBatchDecision(selectedIds, batchAction);
++          setShowConfirm(false);
++          setBatchAction(null);
++          setSelectedIds([]);
++          loadItems(); // Refresh
++      } catch (e) {
++          console.error(e);
++          alert('Batch update failed');
++      }
++  };
++
++  return (
++      <div>
++          <h1>Review</h1>
++          <div className="card">
++              <DateRangePicker value={range} onChange={setRange} />
++              
++              <div style={{ marginBottom: 15, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
++                  <div>
++                    <label style={{ marginRight: 10 }}>Status:</label>
++                    <select value={filter} onChange={e => setFilter(e.target.value)} style={{ padding: 5 }}>
++                        <option value="TO_REVIEW">To Review</option>
++                        <option value="EXPENSE">Expense</option>
++                        <option value="NOT_EXPENSE">Not Expense</option>
++                        <option value="ALL">All</option>
++                    </select>
++                    <button className="btn" style={{ marginLeft: 10 }} onClick={loadItems}>Refresh</button>
++                  </div>
++
++                  {selectedIds.length > 0 && (
++                      <div style={{ display: 'flex', gap: 10, background: '#eef', padding: '5px 10px', borderRadius: 4 }}>
++                          <span style={{ fontWeight: 'bold' }}>{selectedIds.length} selected</span>
++                          <button className="btn btn-success" onClick={() => handleBatchClick('EXPENSE')}>Mark Expense</button>
++                          <button className="btn btn-danger" onClick={() => handleBatchClick('NOT_EXPENSE')}>Mark Not Expense</button>
++                      </div>
++                  )}
++              </div>
++
++              {loading ? <div>Loading...</div> : (
++                  <table style={{ width: '100%', borderCollapse: 'collapse' }}>
++                      <thead>
++                          <tr style={{ textAlign: 'left', background: '#eee' }}>
++                              <th style={{ padding: 8, width: 30 }}>
++                                  <input type="checkbox" 
++                                    checked={items.length > 0 && selectedIds.length === items.length}
++                                    onChange={toggleSelectAll}
++                                  />
++                              </th>
++                              <th style={{ padding: 8 }}>Date</th>
++                              <th style={{ padding: 8 }}>Snippet/Vendor</th>
++                              <th style={{ padding: 8 }}>Status</th>
++                              <th style={{ padding: 8 }}>Action</th>
++                          </tr>
++                      </thead>
++                      <tbody>
++                          {items.map(item => (
++                              <tr key={item.id} style={{ borderBottom: '1px solid #eee', background: selectedIds.includes(item.id) ? '#f9f9ff' : 'transparent' }}>
++                                  <td style={{ padding: 8 }}>
++                                      <input type="checkbox" 
++                                        checked={selectedIds.includes(item.id)}
++                                        onChange={() => toggleSelect(item.id)}
++                                      />
++                                  </td>
++                                  <td style={{ padding: 8 }}>{new Date(item.date_iso).toLocaleDateString()}</td>
++                                  <td style={{ padding: 8 }}>
++                                      <div><strong>{item.from_domain || item.from_name}</strong></div>
++                                      <div style={{ fontSize: 12, color: '#666' }}>{item.snippet}</div>
++                                  </td>
++                                  <td style={{ padding: 8 }}>
++                                      <span style={{ 
++                                          padding: '2px 6px', 
++                                          borderRadius: 4, 
++                                          background: item.label === 'EXPENSE' ? '#dfd' : item.label === 'NOT_EXPENSE' ? '#fdd' : '#ffd',
++                                          fontSize: 12
++                                      }}>
++                                          {item.label}
++                                      </span>
++                                  </td>
++                                  <td style={{ padding: 8 }}>
++                                      <button className="btn" style={{ fontSize: 12, padding: '4px 8px' }} onClick={() => onSelect(item.id)}>
++                                          View
++                                      </button>
++                                  </td>
++                              </tr>
++                          ))}
++                          {items.length === 0 && <tr><td colSpan={5} style={{ padding: 20, textAlign: 'center' }}>No items found</td></tr>}
++                      </tbody>
++                  </table>
++              )}
++          </div>
++
++          <ConfirmDialog 
++            isOpen={showConfirm}
++            title="Batch Update"
++            message={`Are you sure you want to mark ${selectedIds.length} items as ${batchAction}?`}
++            onConfirm={executeBatch}
++            onCancel={() => setShowConfirm(false)}
++          />
++      </div>
++  );
++};
++
++export default ReviewList;
+diff --git a/desktop/shared/ipcTypes.ts b/desktop/shared/ipcTypes.ts
+new file mode 100644
+index 0000000..0f68ddb
+--- /dev/null
++++ b/desktop/shared/ipcTypes.ts
+@@ -0,0 +1,34 @@
++import { DateRange, DateRangeArgs } from '../../src/types/dateRange';
++
++export interface IpcApi {
++  getAppInfo: () => Promise<{ version: string; dataDir: string; dbPath: string; auth: { gmail: boolean; dropbox: boolean } }>;
++  doctor: () => Promise<{ ok: boolean; checks: any[] }>;
++  openExternal: (url: string) => Promise<void>;
++  
++  authGmailStart: () => Promise<{ ok: boolean }>;
++  authDropboxStart: () => Promise<{ ok: boolean }>;
++  
++  scan: (range: DateRangeArgs, options: { mock?: boolean }) => Promise<any>;
++  onScanProgress: (callback: (data: any) => void) => void;
++
++  // Review
++  getReviewList: (range: DateRangeArgs, status?: string) => Promise<any[]>;
++  getReviewDetail: (id: number) => Promise<any>;
++  setDecision: (id: number, status: string, vendor?: string, category?: string) => Promise<{ ok: boolean }>;
++  getNextReviewItem: (currentId: number, range: DateRangeArgs, filter: string) => Promise<number | null>;
++  getSuggestedDecision: (id: number) => Promise<{ status?: string, vendor?: string, category?: string } | null>;
++  applyBatchDecision: (ids: number[], status: string, vendor?: string, category?: string) => Promise<{ ok: boolean }>;
++
++  // Export
++  export: (range: DateRangeArgs, options: { mock?: boolean }) => Promise<any>;
++  onExportProgress: (callback: (data: any) => void) => void;
++
++  // Recurring
++  getRecurring: (range: DateRangeArgs) => Promise<{ patterns: any[], reportPath: string }>;
++
++  // Evidence
++  openEvidence: (path: string) => Promise<void>;
++  revealEvidence: (path: string) => Promise<void>;
++  
++  logError: (error: any) => void;
++}

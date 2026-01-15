@@ -1,0 +1,69 @@
+ROLE: VERIFIER
+TASK: Verify Playwright link capture is safe, bounded, idempotent, and integrates with export + UI.
+
+SAFETY
+- Do not print secrets, tokens, or full URLs with query params.
+- Do not commit .env or data/tokens.
+- Use a small date range or limit.
+
+A) Build + smoke
+1) npm run build
+PASS if build succeeds.
+
+B) Config defaults
+2) Confirm LINK_CAPTURE_ENABLED defaults to false.
+PASS if link capture does not run unless enabled.
+
+C) Enable link capture (local)
+3) Set in .env (not committed):
+   LINK_CAPTURE_ENABLED=true
+   LINK_CAPTURE_MAX_PER_MESSAGE=1
+   LINK_CAPTURE_TIMEOUT_MS=20000
+   LINK_CAPTURE_HEADLESS=true
+4) npm run expense -- doctor
+PASS if doctor reports link capture enabled (boolean only), no secrets.
+
+D) Controlled test case
+5) Identify 1–3 known emails in your range that contain invoice links but no attachments.
+Run:
+   npm run expense -- scan --from 2025-01-01 --to 2025-12-31 --limit 20
+PASS if:
+- At least one LINK_* evidence item is created
+- Captured file exists under staging links folder
+- DB evidence_items has source_url stored (canonicalized) and kind set properly
+
+E) Failure handling
+6) Use a link that requires login (or known portal).
+PASS if:
+- Capture does not hang (timeouts respected)
+- App stores LINK_HTML_SNAPSHOT (if possible) OR marks message TO_REVIEW with reason “Portal/login required”
+- No attempts to bypass captcha/login
+
+F) Idempotency
+7) Re-run same scan (same range + limit).
+PASS if:
+- No duplicate evidence rows created
+- It logs “skipping existing capture” in a safe way (no full URL)
+
+G) Export integration
+8) Run export:
+   npm run expense -- export --from 2025-01-01 --to 2025-12-31 --limit 20
+PASS if:
+- Link evidence files export to Dropbox alongside attachments
+- No duplicates on rerun
+
+H) Electron UI validation
+9) Run desktop and open a message with link evidence.
+PASS if:
+- Evidence list shows link-captured artifacts
+- Open/reveal works
+- UI does not show full sensitive URL query strings
+
+DELIVERABLE
+Write VERIFIER_RESULT.md with:
+- PASS/FAIL checklist A–H
+- Commands run
+- Redacted outputs
+- Any issues and minimal fixes
+
+STOP after writing VERIFIER_RESULT.md.

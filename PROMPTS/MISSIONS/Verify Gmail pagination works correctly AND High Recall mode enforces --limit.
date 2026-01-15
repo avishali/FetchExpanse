@@ -1,0 +1,67 @@
+ROLE: VERIFIER
+TASK: Verify Gmail pagination works correctly AND High Recall mode enforces --limit.
+
+SAFETY
+- Never print or copy OAuth secrets or tokens.
+- Do not commit .env or token files.
+- Redact any personal data from notes.
+
+TEST PLAN (RUN IN ORDER)
+
+A) Build sanity
+1) npm run build
+PASS if build succeeds.
+
+B) Policy enforcement (CRITICAL)
+2) Run:
+   npm run expense -- scan --recall=high --from 2025-01-01 --to 2025-12-31
+PASS if:
+- Command aborts immediately
+- Error message clearly states that --limit is required
+FAIL if:
+- Gmail API is contacted
+- Scan proceeds
+
+C) Normal mode unaffected
+3) Run:
+   npm run expense -- scan --recall=normal --from 2025-01-01 --to 2025-12-31 --mock
+PASS if:
+- Scan proceeds normally
+- No new errors introduced
+
+D) Pagination correctness (real or mock)
+4) Run:
+   npm run expense -- scan --recall=high --from 2025-01-01 --to 2025-12-31 --limit 120
+PASS if:
+- Exactly 120 messages are processed (or fewer if unavailable)
+- No crash or timeout
+
+E) Pagination evidence
+5) Confirm pagination loop exists:
+- nextPageToken loop present
+- maxResults set
+- Early stop on limit
+PASS via code inspection or safe debug logs (page count only).
+
+F) Idempotency
+6) Re-run the same command:
+   npm run expense -- scan --recall=high --from 2025-01-01 --to 2025-12-31 --limit 120
+PASS if:
+- No duplicate DB entries created
+- Counts remain stable
+
+G) Git hygiene
+7) git status
+PASS if:
+- No token files staged
+- No .env staged
+- Only intended source/doc changes present
+
+DELIVERABLE
+Create VERIFIER_RESULT.md with:
+- PASS/FAIL checklist for sections A–G
+- Commands executed
+- Redacted outputs
+- Any issues found and recommendations
+
+STOP after writing VERIFIER_RESULT.md.

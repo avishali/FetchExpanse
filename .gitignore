@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/**
+!data/fixtures/
+*.log
+.env
+.DS_Store
+release/

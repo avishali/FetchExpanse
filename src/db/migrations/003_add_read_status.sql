@@ -1,0 +1,2 @@
+ALTER TABLE messages ADD COLUMN is_read INTEGER DEFAULT 0;
+ALTER TABLE messages ADD COLUMN read_at_ms INTEGER;

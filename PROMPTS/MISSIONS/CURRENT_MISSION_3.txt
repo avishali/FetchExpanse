@@ -1,0 +1,35 @@
+ROLE: IMPLEMENTER
+TASK: FIX regression in scan pipeline caused by accidental deletion of SQL INSERT statement.
+
+CONTEXT
+Phase 2.5 implementation introduced a regression in src/pipeline/steps.ts:
+- The SQL statement used to insert into messages is missing the leading
+  “INSERT INTO messages (” line.
+- This causes scan to crash with:
+  SqliteError: near "gmail_message_id": syntax error
+
+GOAL
+Restore the missing SQL line and ensure scan runs correctly again.
+
+FILES TO MODIFY (ONLY)
+- src/pipeline/steps.ts
+
+REQUIREMENTS
+1) Restore the SQL statement so it is syntactically correct:
+   - Must begin with:
+     INSERT INTO messages (
+   - Followed by the existing column list and VALUES clause.
+2) Do not modify column order or semantics.
+3) Do not change link capture logic, schema, or UI.
+4) Keep changes minimal and localized.
+
+DEFINITION OF DONE
+- npm run build passes
+- npm run expense -- scan (mock or real) no longer crashes
+- No other files modified
+
+OUTPUT FORMAT
+Single unified diff patch (git patch).
+No extra commentary.
+
+BEGIN.
